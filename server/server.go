@@ -70,6 +70,22 @@ type Session struct {
 	lastActivity time.Time
 }
 
+// writeFull writes the entire buffer to conn, looping until complete.
+// net.Conn.Write is allowed to return fewer bytes than requested, so a
+// single unchecked call can silently truncate data and corrupt the stream.
+func writeFull(conn net.Conn, buf []byte) error {
+	for len(buf) > 0 {
+		n, err := conn.Write(buf)
+		if n > 0 {
+			buf = buf[n:]
+		}
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 var (
 	stateMu      sync.RWMutex
 	sessions     = make(map[string]*Session)
@@ -328,8 +344,11 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 					log.Printf("[UPLOAD] Reassembled Seq %d for %s, writing %d bytes to Shadowsocks", seq, requestID, len(data))
 				}
 				sess.writeMutex.Lock()
-				sess.Conn.Write(data)
+				writeErr := writeFull(sess.Conn, data)
 				sess.writeMutex.Unlock()
+				if writeErr != nil {
+					log.Printf("[UPLOAD] Write error for %s seq %d: %v", requestID, seq, writeErr)
+				}
 			} else {
 				log.Printf("[UPLOAD] Error decoding base64 for %s seq %d: %v", requestID, seq, err)
 			}

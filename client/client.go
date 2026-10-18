@@ -9,8 +9,10 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag" // Added for command line flags
 	"fmt"
+	"io"
 	"log"
 	"math/rand"
 	"net"
@@ -55,6 +57,22 @@ type session struct {
 	writeMutex   sync.Mutex
 	lastActivity time.Time
 	mu           sync.Mutex
+}
+
+// writeFull writes the entire buffer to conn, looping until complete.
+// net.Conn.Write is allowed to return fewer bytes than requested, so a
+// single unchecked call can silently truncate data and corrupt the stream.
+func writeFull(conn net.Conn, buf []byte) error {
+	for len(buf) > 0 {
+		n, err := conn.Write(buf)
+		if n > 0 {
+			buf = buf[n:]
+		}
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 type chunkBuffer struct {
@@ -248,8 +266,11 @@ func processDownstreamPayload(msg downstreamPayload) {
 	decoded, err := base64.StdEncoding.DecodeString(msg.Data)
 	if err == nil {
 		sess.writeMutex.Lock()
-		sess.conn.Write(decoded)
+		writeErr := writeFull(sess.conn, decoded)
 		sess.writeMutex.Unlock()
+		if writeErr != nil {
+			log.Printf("[DOWNSTREAM] Write error for ReqID %s: %v", msg.RequestID, writeErr)
+		}
 		if DebugMode {
 			log.Printf("[DOWNSTREAM] Wrote %d bytes to local connection for ReqID: %s", len(decoded), msg.RequestID)
 		}
@@ -288,7 +309,9 @@ readLoop:
 		conn.SetReadDeadline(time.Now().Add(idleTimeout))
 		n, err := conn.Read(buffer)
 		if err != nil {
-			if err.Error() != "EOF" {
+			// Use errors.Is rather than comparing err.Error(): the concrete
+			// error may be wrapped (e.g. *net.OpError around io.EOF).
+			if !errors.Is(err, io.EOF) {
 				log.Printf("[SESSION] Local read error for ReqID %s: %v", reqID, err)
 			}
 			break

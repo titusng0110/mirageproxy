@@ -5,9 +5,9 @@ MirageProxy is a custom-built tunneling tool designed to obscure and relay traff
 Instead of exposing a standard proxy port, MirageProxy wraps all your traffic inside standard, TLS-encrypted HTTPS requests. It uses long-lived streaming HTTP responses (`/poll`) and chunked POST requests (`/upload`) to tunnel your data. To any network observers, it looks exactly like you are browsing a normal HTTPS website, syncing enterprise data, or streaming media.
 
 ### Features
-* **Zero-RTT HTTP Streaming:** Uses NDJSON over a keep-alive HTTP connection for low-latency downstream traffic (fast enough to stream high-definition video).
+* **HTTP Streaming:** Uses NDJSON over a keep-alive HTTP connection for low-latency downstream traffic. Note that throughput is modest by design: Base64 encoding (+33%), JSON framing, and serial POSTs all add overhead. It is fine for browsing, SSH, and everyday use, but it is not a high-bandwidth link.
 * **Standard CA Trust:** By default, the client enforces strict TLS verification, expecting a valid enterprise certificate (like Cloudflare or Let's Encrypt). This makes MITM attacks by intercepting networks impossible.
-* **HMAC Authentication:** Every request is signed with a rolling timestamp and a build-time injected secret. Replay attacks and port scanners are ignored.
+* **HMAC Authentication:** Every request is signed with a rolling timestamp and a build-time injected secret. Port scanners get a fake 404 page, and captured traffic replayed hours later falls outside the signature's 90-second window.
 * **Active Probe Defense:** Unauthorized requests or scanners are immediately served a fake `nginx/1.18.0` 404 page.
 * **TLS Fingerprint Spoofing:** Uses `uTLS` to masquerade the client's TLS `ClientHello` signature as a standard Google Chrome browser, defeating client fingerprinting.
 
@@ -23,7 +23,7 @@ Here is a high-level overview of how MirageProxy encapsulates and routes your tr
                    │ (SOCKS5 Traffic - Port 1080)
                    ▼
      ┌───────────────────────────┐
-     │ Shadowsocks Local         │ (Encrypts data via AEAD)
+     │ Shadowsocks Local         │ (Local SOCKS5 translation)
      └─────────────┬─────────────┘
                    │
                    │ (Encrypted Payload)
@@ -50,7 +50,7 @@ Here is a high-level overview of how MirageProxy encapsulates and routes your tr
                    │
                    ▼
      ┌───────────────────────────┐
-     │ Shadowsocks Server        │ (Decrypts data)
+     │ Shadowsocks Server        │ (Relays data to the internet)
      └─────────────┬─────────────┘
                    │
                    ▼
@@ -65,12 +65,12 @@ Restrictive network environments and advanced DPI systems frequently target stan
 
 MirageProxy takes a different approach: **Steganographic API Mimicry** and **Collateral Freedom**. It intentionally trades raw protocol efficiency for absolute statistical camouflage against well-funded network filters.
 
-* **Defeating Entropy-Based Heuristics:** Advanced firewalls use Shannon entropy heuristics to flag fully encrypted payloads (which look like pure white noise). To counter this, MirageProxy takes the raw encrypted stream, encodes it in Base64 (lowering entropy), and wraps it in standard JSON. To successfully block this, a network monitor's machine learning models would have to intercept, reassemble, parse JSON, and Base64-decode *every single POST request* on the network. This is computationally and financially unfeasible at scale.
+* **Blending Into Ordinary Traffic:** Advanced firewalls use Shannon entropy heuristics to flag fully encrypted payloads (which look like pure white noise). To counter this, MirageProxy encodes the stream in Base64 (slightly lowering entropy) and wraps it in standard JSON, so the traffic profile resembles mundane enterprise API calls. To be clear, this is statistical camouflage, **not** encryption: a middlebox that reassembles and deep-parses individual HTTP requests *can* recognize the pattern. The goal is to look ordinary enough to pass generic mass filtering, not to defeat an adversary that has decided to analyze your traffic specifically.
 * **Hiding in the Noise (Collateral Freedom):** By using chunked HTTP POSTs and long-polling GETs, MirageProxy mimics the exact behavior of mundane, legacy enterprise REST APIs, telemetry uploads, or corporate data syncs. If a network filter aggressively blocks this traffic profile, they risk breaking legitimate traffic.
 * **Defeating Active Probes:** Network scanners frequently send malformed TCP packets or garbage HTTP requests to suspected proxy ports to see how the server responds. MirageProxy drops these instantly and serves a flawless `nginx/1.18.0` 404 Not Found page, tricking network scanners into categorizing the server as an abandoned web host.
-* **Defeating Replay Attacks:** Observers often capture packets and replay them minutes or hours later to map server behavior. MirageProxy utilizes a rolling time window (`X-Auth-Time`) and an HMAC-SHA256 signature (`X-Auth-Sig`). Any replayed packet falls outside the strict 90-second window and is instantly served the fake Nginx 404 page.
+* **Replay Resistance:** Observers sometimes capture packets and replay them minutes or hours later to map server behavior. MirageProxy signs every request with an HMAC-SHA256 signature over a rolling timestamp (`X-Auth-Time` / `X-Auth-Sig`), so replays outside the 90-second window are rejected and served the fake Nginx 404 page. Note the limit: there is no nonce cache, so a captured request replayed *within* that 90-second window would still be accepted. The window bounds the usefulness of a replay rather than eliminating it.
 * **Defeating MITM Attacks:** Intercepting parties sometimes attempt Man-In-The-Middle attacks by presenting fake SSL certificates. Because MirageProxy is designed to run behind a standard reverse proxy or CDN, the client strictly enforces standard CA verification. Any MITM attempt will immediately terminate the connection.
-* **Double Encryption via Shadowsocks:** MirageProxy handles the *transport and stealth*, but it delegates the actual data encryption to Shadowsocks. This defense-in-depth approach allows users to apply an additional layer of proven AEAD cryptography to their traffic. Even if the HTTP tunnel structure is somehow parsed, the underlying payload remains cryptographically secure.
+* **Shadowsocks Layering (Optional):** MirageProxy handles the *transport and stealth*, while Shadowsocks handles the *proxying*. The shipped configs use Shadowsocks in plaintext relay mode (`"method": "none"`), so the only encryption on your traffic is the TLS of the HTTPS tunnel itself — a single encryption layer by default. If you want genuine defense-in-depth, set a real AEAD cipher on both ends (for example `"method": "chacha20-ietf-poly1305"` with a strong password in both `sslocal-config.json` and `ssserver-config.json`); the tunnel will carry that extra encrypted layer transparently.
 
 ---
 
