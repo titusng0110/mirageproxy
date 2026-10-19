@@ -5,7 +5,7 @@ MirageProxy is a custom-built tunneling tool designed to obscure and relay traff
 Instead of exposing a standard proxy port, MirageProxy wraps all your traffic inside standard, TLS-encrypted HTTPS requests. It uses long-lived streaming HTTP responses (`/poll`) and chunked POST requests (`/upload`) to tunnel your data. To any network observers, it looks exactly like you are browsing a normal HTTPS website, syncing enterprise data, or streaming media.
 
 ### Features
-* **HTTP Streaming:** Uses NDJSON over a keep-alive HTTP connection for low-latency downstream traffic. Note that throughput is modest by design: Base64 encoding (+33%), JSON framing, and serial POSTs all add overhead. It is fine for browsing, SSH, and everyday use, but it is not a high-bandwidth link.
+* **HTTP Streaming:** Uses NDJSON over a keep-alive HTTP connection for low-latency downstream traffic. Note that throughput is modest by design: Base64 encoding (+33%), JSON framing, and per-POST overhead all add cost. It is fine for browsing, SSH, and everyday use, but it is not a high-bandwidth link.
 * **Standard CA Trust:** By default, the client enforces strict TLS verification, expecting a valid enterprise certificate (like Cloudflare or Let's Encrypt). This makes MITM attacks by intercepting networks impossible.
 * **HMAC Authentication:** Every request is signed with a rolling timestamp and a build-time injected secret. Port scanners get a fake 404 page, and captured traffic replayed hours later falls outside the signature's 90-second window.
 * **Active Probe Defense:** Unauthorized requests or scanners are immediately served a fake `nginx/1.18.0` 404 page.
@@ -71,6 +71,20 @@ MirageProxy takes a different approach: **Steganographic API Mimicry** and **Col
 * **Replay Resistance:** Observers sometimes capture packets and replay them minutes or hours later to map server behavior. MirageProxy signs every request with an HMAC-SHA256 signature over a rolling timestamp (`X-Auth-Time` / `X-Auth-Sig`), so replays outside the 90-second window are rejected and served the fake Nginx 404 page. Note the limit: there is no nonce cache, so a captured request replayed *within* that 90-second window would still be accepted. The window bounds the usefulness of a replay rather than eliminating it.
 * **Defeating MITM Attacks:** Intercepting parties sometimes attempt Man-In-The-Middle attacks by presenting fake SSL certificates. Because MirageProxy is designed to run behind a standard reverse proxy or CDN, the client strictly enforces standard CA verification. Any MITM attempt will immediately terminate the connection.
 * **Shadowsocks Layering (Optional):** MirageProxy handles the *transport and stealth*, while Shadowsocks handles the *proxying*. The shipped configs use Shadowsocks in plaintext relay mode (`"method": "none"`), so the only encryption on your traffic is the TLS of the HTTPS tunnel itself — a single encryption layer by default. If you want genuine defense-in-depth, set a real AEAD cipher on both ends (for example `"method": "chacha20-ietf-poly1305"` with a strong password in both `sslocal-config.json` and `ssserver-config.json`); the tunnel will carry that extra encrypted layer transparently.
+
+---
+
+## Wire Protocol Details
+
+Both directions move self-describing **parts**: JSON objects carrying `client_id`, `request_id`, `seq` (the stream sequence number), `part`/`total_parts` (fragment indices within one sequence), and a base64 `data` payload. Because every part identifies itself, sequences can be fired and delivered out of order and still be reassembled at the destination.
+
+**Upstream (`POST /upload`):** The client pushes every outgoing part into a single global queue, and a pool of dispatcher workers drains it. Each worker gathers parts from *any* active connection into one batch of up to ~16KB (`{"parts":[...]}`) and fires it immediately; when the queue is empty it rechecks every 7ms. The server replies `200` with a bitmap — `{"acked":"11010"}` — one `'0'`/`'1'` bit per part in batch order. Acked parts are retired; unacked parts are requeued at the front of the queue (so gaps fill first) and retried up to 5 times, after which the originating local connection is torn down. Because the signature identity for uploads is the client (`upload-<clientid>`) rather than a single request, one POST can carry parts of many concurrent sessions.
+
+**Downstream (`GET /poll`):** NDJSON, one `part` object per line (split at 8KB). All sessions feed a single global queue on the server, which a router goroutine fans out into per-client buffers drained by each client's long-poll connection.
+
+**Piggybacked downstream:** `/upload` responses can also carry an optional `downstream` array of parts (up to 8KB of payload, drained non-blockingly from the same per-client buffer). This gives download traffic a second delivery lane riding on upload round-trips — useful when the poll stream momentarily falls behind (e.g. the browser reads slowly while other requests keep uploading) or while the poll connection is reconnecting. Each part is consumed by exactly one lane, so ordering and delivery guarantees are unchanged; when the poll stream keeps up on its own, upload responses simply carry nothing extra.
+
+**Ordering & backpressure:** Neither side requires in-order delivery. Each direction keeps a 32-sequence reorder window: parts of future sequences are buffered, and data is only written to the local end once the head sequence is fully assembled (cascading through any complete sequences behind it). Flow control is pure backpressure — a full queue blocks the producing read loop on every hop (`sslocal → client → server → ssserver`), so nothing is ever dropped; the client additionally caps each connection at 32 sequences sent-but-unacked. A finalized session drains its window (with a short grace period) before closing, so the final marker can never race past in-flight parts.
 
 ---
 

@@ -27,24 +27,47 @@ var (
 )
 
 const (
-	LocalListenAddr = ":30001"
-	ShadowSocksAddr = "127.0.0.1:5080"
-	readTimeout     = 180 * time.Second
-	chunkSize       = 16 * 1024
-	idleTimeout     = 15 * time.Minute
+	LocalListenAddr     = ":30001"
+	ShadowSocksAddr     = "127.0.0.1:5080"
+	readTimeout         = 180 * time.Second
+	downstreamChunkSize = 8 * 1024 // server→client part size: small enough to piggyback on POST responses
+	piggybackBudget     = 8 * 1024 // max downstream data attached to one upload response
+	idleTimeout         = 15 * time.Minute
+	downstreamQueueCap  = 8192             // global downstream queue (parts); producers block when full
+	groupQueueCap       = 2000             // per-client downstream buffer drained by /poll and upload responses
+	windowSeqs          = 32               // per-session upload reorder window (sequences)
+	finalGrace          = 10 * time.Second // how long a finalized session waits for its window to drain
+	tombstoneTTL        = 2 * time.Minute  // how late parts for a closed session are NAKed instead of recreated
 )
 
-type postPayload struct {
-	Data  string `json:"data,omitempty"`
-	Final bool   `json:"final,omitempty"`
+// part is the single self-describing unit of transfer in both directions.
+// Upstream it arrives inside a POST batch; downstream it is one NDJSON line.
+// Because every part carries its request/seq/part coordinates, sequences may
+// be fired and delivered out of order and be reassembled at the destination.
+type part struct {
+	ClientID   string `json:"client_id,omitempty"`
+	RequestID  string `json:"request_id,omitempty"`
+	Seq        int    `json:"seq"`
+	Part       int    `json:"part"`
+	TotalParts int    `json:"total_parts"`
+	Data       string `json:"data,omitempty"`
+	Final      bool   `json:"final,omitempty"`
 }
 
-type downstreamPayload struct {
-	RequestID  string `json:"request_id,omitempty"`
-	Seq        int    `json:"seq,omitempty"`
-	Data       string `json:"data,omitempty"`
-	Part       int    `json:"part,omitempty"`
-	TotalParts int    `json:"total_parts,omitempty"`
+// postBatch is the upload request body: parts gathered by the client's
+// dispatcher workers, totalling at most ~16KB of marshalled payload.
+type postBatch struct {
+	Parts []part `json:"parts"`
+}
+
+// ackPayload is the upload response. Acked is one '0'/'1' bit per uploaded
+// part, in batch order: '1' means the part was accepted (buffered, duplicate
+// of already-flushed data, or final marker); '0' means the client must
+// retry. Downstream, when present, piggybacks queued downstream parts on
+// the response so download traffic also moves on upload round-trips.
+type ackPayload struct {
+	Acked      string `json:"acked"`
+	Downstream []part `json:"downstream,omitempty"`
 }
 
 type messageBuffer struct {
@@ -53,8 +76,18 @@ type messageBuffer struct {
 	updatedAt  time.Time
 }
 
+// rxWindow is the upload reorder window for one session: the next sequence
+// expected at the head plus buffered future sequences. Data is written to
+// Shadowsocks only when the head sequence is fully assembled, cascading
+// through any complete sequences behind it.
+type rxWindow struct {
+	head      int
+	entries   map[int]*messageBuffer
+	updatedAt time.Time
+}
+
 type ClientGroup struct {
-	DownstreamChan chan string
+	DownstreamChan chan part
 	LastActive     time.Time
 }
 
@@ -65,8 +98,10 @@ type Session struct {
 	writeMutex   sync.Mutex
 	cancel       context.CancelFunc
 	mu           sync.Mutex
-	postBuffers  map[int]*messageBuffer
-	seenSeqs     map[int]time.Time
+	win          *rxWindow
+	closed       bool
+	finalSeen    bool
+	finalizer    bool // finalizer goroutine started
 	lastActivity time.Time
 }
 
@@ -90,6 +125,13 @@ var (
 	stateMu      sync.RWMutex
 	sessions     = make(map[string]*Session)
 	clientGroups = make(map[string]*ClientGroup)
+
+	tombstonesMu sync.Mutex
+	tombstones   = make(map[string]time.Time)
+
+	// Global downstream queue: every session pushes its parts here, and a
+	// single router goroutine fans them out to the per-client buffers.
+	downstream = make(chan part, downstreamQueueCap)
 )
 
 func generateSignature(timestamp int64, id string) string {
@@ -113,9 +155,16 @@ func requireAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		timeStr := r.Header.Get("X-Auth-Time")
 		clientSig := r.Header.Get("X-Auth-Sig")
+		clientID := r.URL.Query().Get("clientid")
 		reqID := r.URL.Query().Get("requestid")
-		if r.URL.Path == "/poll" {
-			reqID = "poll-" + r.URL.Query().Get("clientid")
+		switch r.URL.Path {
+		case "/poll":
+			// The poll connection is bound to the client identity.
+			reqID = "poll-" + clientID
+		case "/upload":
+			// Upload batches span many concurrent sessions, so the signature
+			// identity is the client, not any single request.
+			reqID = "upload-" + clientID
 		}
 
 		clientTime, err := strconv.ParseInt(timeStr, 10, 64)
@@ -147,7 +196,7 @@ func getClientGroup(clientID string) *ClientGroup {
 	cg, exists := clientGroups[clientID]
 	if !exists {
 		cg = &ClientGroup{
-			DownstreamChan: make(chan string, 2000),
+			DownstreamChan: make(chan part, groupQueueCap),
 			LastActive:     time.Now(),
 		}
 		clientGroups[clientID] = cg
@@ -157,7 +206,30 @@ func getClientGroup(clientID string) *ClientGroup {
 	return cg
 }
 
+// downstreamRouter drains the global downstream queue and fans each part
+// out to the owning client's buffer. The send blocks when a client's buffer
+// is full, which backs up the global queue and ultimately the sessions
+// feeding it — the backpressure path from a stalled /poll reader all the
+// way to ssserver.
+func downstreamRouter() {
+	for p := range downstream {
+		cg := getClientGroup(p.ClientID)
+		// Blocking send: a full client buffer backs pressure up through the
+		// global queue to the sessions producing it. Consumers marshal at
+		// delivery time (/poll lines and upload-response piggybacks).
+		cg.DownstreamChan <- p
+	}
+}
+
 func (s *Session) closeSession() {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return
+	}
+	s.closed = true
+	s.mu.Unlock()
+
 	if s.cancel != nil {
 		s.cancel()
 	}
@@ -167,10 +239,62 @@ func (s *Session) closeSession() {
 	stateMu.Lock()
 	delete(sessions, s.RequestID)
 	stateMu.Unlock()
+	// Tombstone the request so late retried parts are NAKed instead of
+	// resurrecting a zombie Shadowsocks connection.
+	tombstonesMu.Lock()
+	tombstones[s.RequestID] = time.Now()
+	tombstonesMu.Unlock()
+	// Tell the client the session is gone so its local connection fails
+	// fast instead of hanging. Best effort: if the downstream queue is
+	// momentarily full the signal is dropped and the client falls back to
+	// its own idle handling.
+	if s.ClientID != "" {
+		select {
+		case downstream <- part{ClientID: s.ClientID, RequestID: s.RequestID, Final: true}:
+		default:
+		}
+	}
 	log.Printf("[SESSION] Closed session %s", s.RequestID)
 }
 
-func (s *Session) startSession(ctx context.Context, cg *ClientGroup) {
+// beginDrain marks the session as finalized. The session is closed once the
+// reorder window has fully drained, or after finalGrace, so the final
+// marker can never race past still-in-flight parts. It returns false when
+// the session is already closed (the final marker is then NAKed).
+func (s *Session) beginDrain() bool {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return false
+	}
+	s.finalSeen = true
+	if s.finalizer {
+		s.mu.Unlock()
+		return true
+	}
+	s.finalizer = true
+	s.mu.Unlock()
+
+	go func() {
+		deadline := time.Now().Add(finalGrace)
+		for {
+			s.mu.Lock()
+			buffered := len(s.win.entries)
+			s.mu.Unlock()
+			if buffered == 0 || time.Now().After(deadline) {
+				if buffered > 0 && DebugMode {
+					log.Printf("[SESSION] Final grace expired for %s with %d buffered seq(s)", s.RequestID, buffered)
+				}
+				s.closeSession()
+				return
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+	}()
+	return true
+}
+
+func (s *Session) startSession(ctx context.Context) {
 	defer s.closeSession()
 	buf := make([]byte, 128*1024)
 	seq := 0
@@ -204,30 +328,32 @@ func (s *Session) startSession(ctx context.Context, cg *ClientGroup) {
 
 			encodedStr := base64.StdEncoding.EncodeToString(buf[:n])
 			totalLen := len(encodedStr)
-			totalChunks := (totalLen + chunkSize - 1) / chunkSize
+			totalChunks := (totalLen + downstreamChunkSize - 1) / downstreamChunkSize
 
 			if DebugMode {
-				log.Printf("[DOWNSTREAM] %s: Read %d bytes from Shadowsocks, queuing %d chunks (Seq: %d)", s.RequestID, n, totalChunks, seq)
+				log.Printf("[DOWNSTREAM] %s: Read %d bytes from Shadowsocks, queueing %d parts (Seq: %d)", s.RequestID, n, totalChunks, seq)
 			}
 
+			// The send into the global queue blocks when it is full: that is
+			// the backpressure point between ssserver and the tunnel.
 			for i := 0; i < totalChunks; i++ {
-				start := i * chunkSize
-				end := start + chunkSize
+				start := i * downstreamChunkSize
+				end := start + downstreamChunkSize
 				if end > totalLen {
 					end = totalLen
 				}
 
-				payload := downstreamPayload{
+				p := part{
+					ClientID:   s.ClientID,
 					RequestID:  s.RequestID,
 					Seq:        seq,
-					Data:       encodedStr[start:end],
 					Part:       i + 1,
 					TotalParts: totalChunks,
+					Data:       encodedStr[start:end],
 				}
-				jsonData, _ := json.Marshal(payload)
 
 				select {
-				case cg.DownstreamChan <- string(jsonData):
+				case downstream <- p:
 				case <-ctx.Done():
 					return
 				}
@@ -236,125 +362,222 @@ func (s *Session) startSession(ctx context.Context, cg *ClientGroup) {
 	}
 }
 
-func uploadHandler(w http.ResponseWriter, r *http.Request) {
-	q := r.URL.Query()
-	requestID := q.Get("requestid")
-	clientID := q.Get("clientid")
-	seq, _ := strconv.Atoi(q.Get("seq"))
-	part, _ := strconv.Atoi(q.Get("part"))
-	totalPart, _ := strconv.Atoi(q.Get("totalpart"))
+// admit buffers one part into the session's reorder window and flushes to
+// Shadowsocks whenever the head sequence completes. It returns true if the
+// part was accepted (or is a harmless duplicate of already-flushed data)
+// and false when it must be NAKed to the client.
+func (s *Session) admit(seq, partNum, total int, data string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.lastActivity = time.Now()
 
-	var payload postPayload
-	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+	w := s.win
+	if s.closed {
+		return false // session gone; NAK so the client can tear down
+	}
+	if seq < w.head {
+		return true // already flushed; idempotent duplicate
+	}
+	if seq >= w.head+windowSeqs {
+		if DebugMode {
+			log.Printf("[UPLOAD] Seq %d outside window for %s (head %d); NAKing", seq, s.RequestID, w.head)
+		}
+		return false // outside the reorder window
+	}
+
+	mb := w.entries[seq]
+	if mb == nil {
+		mb = &messageBuffer{totalParts: total, parts: make(map[int]string), updatedAt: time.Now()}
+		w.entries[seq] = mb
+	}
+	if _, dup := mb.parts[partNum]; !dup {
+		mb.parts[partNum] = data
+		mb.updatedAt = time.Now()
+		w.updatedAt = time.Now()
+	}
+
+	if seq == w.head {
+		s.flushLocked()
+	}
+	return true
+}
+
+// flushLocked writes every complete sequence at the head of the window,
+// advancing the head and cascading into subsequent sequences.
+// Caller must hold s.mu.
+func (s *Session) flushLocked() {
+	w := s.win
+	for {
+		mb := w.entries[w.head]
+		if mb == nil || len(mb.parts) < mb.totalParts {
+			break
+		}
+		flushedSeq := w.head
+
+		var combined strings.Builder
+		for i := 1; i <= mb.totalParts; i++ {
+			combined.WriteString(mb.parts[i])
+		}
+		data, err := base64.StdEncoding.DecodeString(combined.String())
+
+		delete(w.entries, w.head)
+		w.head++
+		w.updatedAt = time.Now()
+
+		if err != nil {
+			log.Printf("[UPLOAD] Error decoding base64 for %s seq %d: %v", s.RequestID, flushedSeq, err)
+			continue
+		}
+		if DebugMode {
+			log.Printf("[UPLOAD] Reassembled Seq %d for %s, writing %d bytes to Shadowsocks", flushedSeq, s.RequestID, len(data))
+		}
+		s.writeMutex.Lock()
+		writeErr := writeFull(s.Conn, data)
+		s.writeMutex.Unlock()
+		if writeErr != nil {
+			log.Printf("[UPLOAD] Write error for %s seq %d: %v", s.RequestID, flushedSeq, writeErr)
+		}
+	}
+}
+
+// handleUploadPart processes one part of an upload batch and reports whether
+// it was accepted.
+func handleUploadPart(p part) bool {
+	if p.Final {
+		stateMu.RLock()
+		sess, exists := sessions[p.RequestID]
+		stateMu.RUnlock()
+		if !exists {
+			// Unknown or tombstoned session: NAK so the client stops
+			// retrying instead of resurrecting a dead session.
+			return false
+		}
+		log.Printf("[UPLOAD] Received final payload for session %s, draining...", p.RequestID)
+		return sess.beginDrain()
+	}
+
+	if p.Data == "" || p.TotalParts <= 0 || p.Part < 1 || p.Part > p.TotalParts {
+		return false // malformed part
+	}
+
+	stateMu.RLock()
+	sess, exists := sessions[p.RequestID]
+	stateMu.RUnlock()
+
+	if !exists {
+		tombstonesMu.Lock()
+		_, dead := tombstones[p.RequestID]
+		tombstonesMu.Unlock()
+		if dead {
+			return false
+		}
+
+		log.Printf("[SESSION] Dialing Shadowsocks for new session %s...", p.RequestID)
+
+		conn, err := net.DialTimeout("tcp", ShadowSocksAddr, 5*time.Second)
+		if err != nil {
+			log.Printf("[SESSION] Failed to connect to Shadowsocks for %s: %v", p.RequestID, err)
+			return false // NAK: the client will retry this part
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		newSess := &Session{
+			RequestID:    p.RequestID,
+			ClientID:     p.ClientID,
+			Conn:         conn,
+			cancel:       cancel,
+			win:          &rxWindow{head: 1, entries: make(map[int]*messageBuffer), updatedAt: time.Now()},
+			lastActivity: time.Now(),
+		}
+
+		stateMu.Lock()
+		if existingSess, stillExists := sessions[p.RequestID]; stillExists {
+			sess = existingSess
+			conn.Close()
+			cancel()
+		} else {
+			sessions[p.RequestID] = newSess
+			sess = newSess
+			go sess.startSession(ctx)
+			log.Printf("[SESSION] Successfully connected %s to Shadowsocks", p.RequestID)
+		}
+		stateMu.Unlock()
+	}
+
+	return sess.admit(p.Seq, p.Part, p.TotalParts, p.Data)
+}
+
+func uploadHandler(w http.ResponseWriter, r *http.Request) {
+	clientID := r.URL.Query().Get("clientid")
+
+	var batch postBatch
+	if err := json.NewDecoder(r.Body).Decode(&batch); err != nil {
 		log.Printf("[UPLOAD] Bad Request from %s: %v", r.RemoteAddr, err)
 		http.Error(w, "Bad Request", http.StatusBadRequest)
 		return
 	}
 
-	cg := getClientGroup(clientID)
+	if DebugMode {
+		log.Printf("[UPLOAD] Received batch of %d part(s) from %s", len(batch.Parts), r.RemoteAddr)
+	}
 
-	stateMu.RLock()
-	sess, exists := sessions[requestID]
-	stateMu.RUnlock()
+	acks := make([]bool, len(batch.Parts))
+	for i := range batch.Parts {
+		p := batch.Parts[i]
+		p.ClientID = clientID // the authenticated identity wins over the body
+		acks[i] = handleUploadPart(p)
+	}
 
-	if !exists {
-		log.Printf("[SESSION] Dialing Shadowsocks for new session %s...", requestID)
-
-		conn, err := net.DialTimeout("tcp", ShadowSocksAddr, 5*time.Second)
-
-		if err == nil {
-			ctx, cancel := context.WithCancel(context.Background())
-			newSess := &Session{
-				RequestID:    requestID,
-				ClientID:     clientID,
-				Conn:         conn,
-				cancel:       cancel,
-				postBuffers:  make(map[int]*messageBuffer),
-				seenSeqs:     make(map[int]time.Time),
-				lastActivity: time.Now(),
-			}
-
-			stateMu.Lock()
-			if existingSess, stillExists := sessions[requestID]; stillExists {
-				sess = existingSess
-				conn.Close()
-			} else {
-				sessions[requestID] = newSess
-				sess = newSess
-				go sess.startSession(ctx, cg)
-				log.Printf("[SESSION] Successfully connected %s to Shadowsocks", requestID)
-			}
-			stateMu.Unlock()
+	bits := make([]byte, len(acks))
+	for i, ok := range acks {
+		if ok {
+			bits[i] = '1'
 		} else {
-			log.Printf("[SESSION] Failed to connect to Shadowsocks for %s: %v", requestID, err)
-			w.WriteHeader(http.StatusGatewayTimeout)
-			return
+			bits[i] = '0'
 		}
 	}
 
-	if sess == nil {
-		w.WriteHeader(http.StatusOK)
-		return
-	}
+	resp := ackPayload{Acked: string(bits)}
 
-	if payload.Final {
-		log.Printf("[UPLOAD] Received final payload for session %s, closing...", requestID)
-		go sess.closeSession()
-		w.WriteHeader(http.StatusOK)
-		return
-	}
-
-	sess.mu.Lock()
-	defer sess.mu.Unlock()
-	sess.lastActivity = time.Now()
-
-	if _, seen := sess.seenSeqs[seq]; seen && seq != 0 {
-		if DebugMode {
-			log.Printf("[UPLOAD] Ignoring duplicate chunk Seq %d Part %d/%d for %s", seq, part, totalPart, requestID)
-		}
-		w.WriteHeader(http.StatusOK)
-		return
-	}
-
-	if payload.Data != "" {
-		if DebugMode {
-			log.Printf("[UPLOAD] Received chunk Seq %d Part %d/%d for %s", seq, part, totalPart, requestID)
-		}
-
-		mb, ok := sess.postBuffers[seq]
-		if !ok {
-			mb = &messageBuffer{totalParts: totalPart, parts: make(map[int]string), updatedAt: time.Now()}
-			sess.postBuffers[seq] = mb
-		}
-		mb.parts[part] = payload.Data
-		mb.updatedAt = time.Now()
-
-		if len(mb.parts) == mb.totalParts {
-			var combined strings.Builder
-			for i := 1; i <= mb.totalParts; i++ {
-				combined.WriteString(mb.parts[i])
+	// Piggyback ride: attach queued downstream parts to this response so
+	// download traffic also moves on upload round-trips. Non-blocking and
+	// capped at piggybackBudget bytes of payload; each part is consumed by
+	// exactly one lane (this response or /poll), never both, so per-session
+	// ordering and delivery guarantees are unchanged.
+	cg := getClientGroup(clientID)
+	budget := piggybackBudget
+drain:
+	for count := 0; count < 64; count++ { // count cap bounds response size when parts are tiny
+		select {
+		case p := <-cg.DownstreamChan:
+			if len(p.Data) > budget {
+				// Doesn't fit in the remaining budget: hand it back for the
+				// next consumer. The client's reorder window tolerates the
+				// resulting reshuffle.
+				cg.DownstreamChan <- p
+				break drain
 			}
-			data, err := base64.StdEncoding.DecodeString(combined.String())
-
-			delete(sess.postBuffers, seq)
-			sess.seenSeqs[seq] = time.Now()
-
-			if err == nil {
-				if DebugMode {
-					log.Printf("[UPLOAD] Reassembled Seq %d for %s, writing %d bytes to Shadowsocks", seq, requestID, len(data))
-				}
-				sess.writeMutex.Lock()
-				writeErr := writeFull(sess.Conn, data)
-				sess.writeMutex.Unlock()
-				if writeErr != nil {
-					log.Printf("[UPLOAD] Write error for %s seq %d: %v", requestID, seq, writeErr)
-				}
-			} else {
-				log.Printf("[UPLOAD] Error decoding base64 for %s seq %d: %v", requestID, seq, err)
+			budget -= len(p.Data)
+			resp.Downstream = append(resp.Downstream, p)
+			if budget == 0 {
+				break drain
 			}
+		default:
+			break drain
 		}
 	}
-	w.WriteHeader(http.StatusOK)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
+
+// writeDownstreamPart emits one part as an NDJSON line on the poll stream.
+func writeDownstreamPart(w http.ResponseWriter, p part) {
+	line, err := json.Marshal(p)
+	if err != nil {
+		return // cannot happen: part holds only strings and ints
+	}
+	w.Write(append(line, '\n'))
 }
 
 func pollHandler(w http.ResponseWriter, r *http.Request) {
@@ -388,14 +611,14 @@ func pollHandler(w http.ResponseWriter, r *http.Request) {
 			if canFlush {
 				flusher.Flush()
 			}
-		case msg := <-cg.DownstreamChan:
-			w.Write([]byte(msg + "\n"))
+		case p := <-cg.DownstreamChan:
+			writeDownstreamPart(w, p)
 
 		drainLoop:
 			for i := 0; i < 50; i++ {
 				select {
 				case m := <-cg.DownstreamChan:
-					w.Write([]byte(m + "\n"))
+					writeDownstreamPart(w, m)
 				default:
 					break drainLoop
 				}
@@ -418,18 +641,24 @@ func backgroundCleanup() {
 			sess.mu.Lock()
 			inactive := now.Sub(sess.lastActivity) > idleTimeout
 
-			for seq, buf := range sess.postBuffers {
-				if now.Sub(buf.updatedAt) > 2*time.Minute {
-					if DebugMode {
-						log.Printf("[CLEANUP] Evicted stale chunk buffer for %s Seq %d", reqID, seq)
+			w := sess.win
+			if w != nil && len(w.entries) > 0 && now.Sub(w.updatedAt) > 2*time.Minute {
+				// The head sequence never completed; slide past the gap so
+				// buffered future sequences can flow again.
+				minSeq := -1
+				for s := range w.entries {
+					if minSeq == -1 || s < minSeq {
+						minSeq = s
 					}
-					delete(sess.postBuffers, seq)
 				}
-			}
-			for seq, t := range sess.seenSeqs {
-				if now.Sub(t) > 5*time.Minute {
-					delete(sess.seenSeqs, seq)
+				if minSeq > w.head {
+					if DebugMode {
+						log.Printf("[CLEANUP] Sliding upload window for %s from seq %d to %d", reqID, w.head, minSeq)
+					}
+					w.head = minSeq
+					sess.flushLocked()
 				}
+				w.updatedAt = now
 			}
 			sess.mu.Unlock()
 
@@ -448,6 +677,14 @@ func backgroundCleanup() {
 				log.Printf("[CLEANUP] Evicted dead session: %s", reqID)
 			}
 		}
+
+		tombstonesMu.Lock()
+		for id, t := range tombstones {
+			if now.Sub(t) > tombstoneTTL {
+				delete(tombstones, id)
+			}
+		}
+		tombstonesMu.Unlock()
 	}
 }
 
@@ -455,6 +692,7 @@ func main() {
 	log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)
 	log.Println("[MAIN] Starting proxy server...")
 	go backgroundCleanup()
+	go downstreamRouter()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/upload", requireAuth(uploadHandler))
