@@ -14,7 +14,7 @@ ARG REMOTE_SERVER_URL="https://127.0.0.1:30001"
 
 RUN set -ex; \
     SECRET=$(openssl rand -base64 32); \
-    openssl req -x509 -newkey rsa:4096 -keyout server.key -out server.crt -days 3650 -nodes -subj "/CN=cloudflare.com"; \
+    openssl req -x509 -newkey rsa:4096 -keyout server.key -out server.crt -days 3650 -nodes -subj "/CN=localhost"; \
     CGO_ENABLED=0 go build -ldflags "-s -w -X 'main.ProxySecret=$SECRET'" -o server_bin server/server.go; \
     CGO_ENABLED=0 go build -ldflags "-s -w -X 'main.ProxySecret=$SECRET' -X 'main.RemoteServerURL=${REMOTE_SERVER_URL}'" -o client_bin client/client.go;
 

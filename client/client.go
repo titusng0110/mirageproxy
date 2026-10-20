@@ -60,12 +60,6 @@ type part struct {
 	Final      bool   `json:"final,omitempty"`
 }
 
-// postBatch is the upload request body: parts gathered from any active
-// connection, totalling at most ~16KB of marshalled payload.
-type postBatch struct {
-	Parts []part `json:"parts"`
-}
-
 // ackPayload is the upload response. Acked is one '0'/'1' bit per uploaded
 // part, in batch order: '1' means the server accepted the part (buffered,
 // duplicate of already-flushed data, or final marker); '0' means it must be
@@ -482,6 +476,9 @@ func runPoller(client *http.Client) {
 				log.Printf("[POLL] JSON unmarshal error: %v", err)
 			}
 		}
+		if err := scanner.Err(); err != nil {
+			log.Printf("[POLL] Stream read error: %v", err)
+		}
 		resp.Body.Close()
 
 		if DebugMode {
@@ -592,7 +589,7 @@ func processDownstreamPayload(p part) {
 	}
 }
 
-func handleConnection(conn net.Conn, client *http.Client) {
+func handleConnection(conn net.Conn) {
 	defer conn.Close()
 	reqID := fmt.Sprintf("%d-%d", time.Now().UnixNano(), rand.Intn(1000))
 	log.Printf("[SESSION] Accepted local connection %s -> mapped to ReqID: %s", conn.RemoteAddr(), reqID)
@@ -785,7 +782,7 @@ func main() {
 	for {
 		conn, err := ln.Accept()
 		if err == nil {
-			go handleConnection(conn, httpClient)
+			go handleConnection(conn)
 		} else {
 			log.Printf("[MAIN] Accept error: %v", err)
 		}

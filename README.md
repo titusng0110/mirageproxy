@@ -8,7 +8,7 @@ Instead of exposing a standard proxy port, MirageProxy wraps all your traffic in
 * **HTTP Streaming:** Uses NDJSON over a keep-alive HTTP connection for low-latency downstream traffic. Note that throughput is modest by design: Base64 encoding (+33%), JSON framing, and per-POST overhead all add cost. It is fine for browsing, SSH, and everyday use, but it is not a high-bandwidth link.
 * **Standard CA Trust:** By default, the client enforces strict TLS verification, expecting a valid enterprise certificate (like Cloudflare or Let's Encrypt). This makes MITM attacks by intercepting networks impossible.
 * **HMAC Authentication:** Every request is signed with a rolling timestamp and a build-time injected secret. Port scanners get a fake 404 page, and captured traffic replayed hours later falls outside the signature's 90-second window.
-* **Active Probe Defense:** Unauthorized requests or scanners are immediately served a fake `nginx/1.18.0` 404 page.
+* **Active Probe Defense:** Unauthorized requests or scanners are immediately served a fake `nginx/1.31.7` 404 page.
 * **TLS Fingerprint Spoofing:** Uses `uTLS` to masquerade the client's TLS `ClientHello` signature as a standard Google Chrome browser, defeating client fingerprinting.
 
 ---
@@ -67,7 +67,7 @@ MirageProxy takes a different approach: **Steganographic API Mimicry** and **Col
 
 * **Blending Into Ordinary Traffic:** Advanced firewalls use Shannon entropy heuristics to flag fully encrypted payloads (which look like pure white noise). To counter this, MirageProxy encodes the stream in Base64 (slightly lowering entropy) and wraps it in standard JSON, so the traffic profile resembles mundane enterprise API calls. To be clear, this is statistical camouflage, **not** encryption: a middlebox that reassembles and deep-parses individual HTTP requests *can* recognize the pattern. The goal is to look ordinary enough to pass generic mass filtering, not to defeat an adversary that has decided to analyze your traffic specifically.
 * **Hiding in the Noise (Collateral Freedom):** By using chunked HTTP POSTs and long-polling GETs, MirageProxy mimics the exact behavior of mundane, legacy enterprise REST APIs, telemetry uploads, or corporate data syncs. If a network filter aggressively blocks this traffic profile, they risk breaking legitimate traffic.
-* **Defeating Active Probes:** Network scanners frequently send malformed TCP packets or garbage HTTP requests to suspected proxy ports to see how the server responds. MirageProxy drops these instantly and serves a flawless `nginx/1.18.0` 404 Not Found page, tricking network scanners into categorizing the server as an abandoned web host.
+* **Defeating Active Probes:** Network scanners frequently send malformed TCP packets or garbage HTTP requests to suspected proxy ports to see how the server responds. MirageProxy drops these instantly and serves a flawless `nginx/1.31.7` 404 Not Found page, tricking network scanners into categorizing the server as an abandoned web host.
 * **Replay Resistance:** Observers sometimes capture packets and replay them minutes or hours later to map server behavior. MirageProxy signs every request with an HMAC-SHA256 signature over a rolling timestamp (`X-Auth-Time` / `X-Auth-Sig`), so replays outside the 90-second window are rejected and served the fake Nginx 404 page. Note the limit: there is no nonce cache, so a captured request replayed *within* that 90-second window would still be accepted. The window bounds the usefulness of a replay rather than eliminating it.
 * **Defeating MITM Attacks:** Intercepting parties sometimes attempt Man-In-The-Middle attacks by presenting fake SSL certificates. Because MirageProxy is designed to run behind a standard reverse proxy or CDN, the client strictly enforces standard CA verification. Any MITM attempt will immediately terminate the connection.
 * **Shadowsocks Layering (Optional):** MirageProxy handles the *transport and stealth*, while Shadowsocks handles the *proxying*. The shipped configs use Shadowsocks in plaintext relay mode (`"method": "none"`), so the only encryption on your traffic is the TLS of the HTTPS tunnel itself — a single encryption layer by default. If you want genuine defense-in-depth, set a real AEAD cipher on both ends (for example `"method": "chacha20-ietf-poly1305"` with a strong password in both `sslocal-config.json` and `ssserver-config.json`); the tunnel will carry that extra encrypted layer transparently.
@@ -211,6 +211,33 @@ curl -v -L --proxy socks5h://127.0.0.1:1080 https://www.google.com
 ### Browser Setup (Firefox / Chrome)
 * **Firefox:** Go to Settings -> Network Settings. Select "Manual proxy configuration". Set SOCKS Host to `127.0.0.1` and Port to `1080`. Check "Proxy DNS when using SOCKS v5".
 * **Chrome/Edge:** It is highly recommended to use an extension like **SwitchyOmega** to route your traffic through `127.0.0.1:1080`.
+
+## 5. Automated Smoke Test
+
+The `smoke/` directory contains an end-to-end smoke test that exercises the full chain —
+`curl → sslocal → client → HTTPS → server → ssserver → test target` — and verifies data
+integrity with SHA-256, plus the active-probe camouflage.
+
+**Local mode** (no Docker; builds client + server from source with a fresh paired secret):
+```bash
+./smoke/run-smoke.sh
+```
+
+**Docker mode** (mirrors a real VPS deployment; builds the image, extracts the paired
+client from the container, will ask for your sudo password):
+```bash
+./smoke/run-smoke-docker.sh
+```
+
+What it checks:
+1. Health check through the full tunnel.
+2. Download integrity (1 KiB / 4 MiB / chunked streaming) against a deterministic generator.
+3. Upload integrity (1 MiB POST echoed back through the tunnel).
+4. Parallel downloads (2 × 1 MiB) across concurrent sessions.
+5. Unauthenticated probes receive the fake `nginx/1.31.7` 404 page.
+6. Real-internet reachability through the tunnel (informational only).
+
+Logs and artifacts are kept in `/tmp/mirage-smoke-*/` for debugging.
 
 ## Troubleshooting
 
