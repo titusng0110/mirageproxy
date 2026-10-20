@@ -85,9 +85,9 @@ openssl req -x509 -newkey rsa:4096 -keyout "$WORK/server.key" \
 
 SECRET="$(openssl rand -base64 32)"
 go build -ldflags "-s -w -X main.ProxySecret=${SECRET}" \
-	-o "$WORK/server_bin" "$ROOT/server/server.go"
+	-o "$WORK/server_bin" "$ROOT/server"
 go build -ldflags "-s -w -X main.ProxySecret=${SECRET} -X main.RemoteServerURL=https://127.0.0.1:30001" \
-	-o "$WORK/client_bin" "$ROOT/client/client.go"
+	-o "$WORK/client_bin" "$ROOT/client"
 go build -o "$WORK/testserver" "$ROOT/smoke/testserver.go"
 
 # ------------------------------- binaries -------------------------------
