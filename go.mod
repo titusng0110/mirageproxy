@@ -1,6 +1,6 @@
 module mirageproxy
 
-go 1.27.2
+go 1.27.3
 
 require (
 	github.com/refraction-networking/utls v1.8.2
