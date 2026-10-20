@@ -337,7 +337,7 @@ func fireBatch(client *http.Client, batch []uploadItem) ([]bool, []part, error) 
 	req.Header.Set("X-Auth-Time", fmt.Sprintf("%d", now))
 	req.Header.Set("X-Auth-Sig", generateSignature(now, "upload-"+myClientID))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/114.0.0.0")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36")
 
 	if DebugMode {
 		log.Printf("[UPLOAD] POST batch of %d part(s), %d bytes", len(batch), body.Len())
