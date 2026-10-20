@@ -10,6 +10,7 @@ Instead of exposing a standard proxy port, MirageProxy wraps all your traffic in
 * **HMAC Authentication:** Every request is signed with a rolling timestamp and a build-time injected secret. Port scanners get a fake 404 page, and captured traffic replayed hours later falls outside the signature's 90-second window.
 * **Active Probe Defense:** Unauthorized requests or scanners are immediately served a fake `nginx/1.31.7` 404 page.
 * **TLS Fingerprint Spoofing:** Uses `uTLS` to masquerade the client's TLS `ClientHello` signature as a standard Google Chrome browser, defeating client fingerprinting.
+* **Connection Rotation:** The server ages every TCP connection out at a uniformly random 60–300 second lifetime — HTTP/2 connections are wound down with a graceful `GOAWAY(NO_ERROR)` first, HTTP/1.1 with a plain close — so no tunnel connection ever stays up long enough for DPI flow heuristics to single it out.
 
 ---
 
@@ -66,7 +67,7 @@ Restrictive network environments and advanced DPI systems frequently target stan
 MirageProxy takes a different approach: **Steganographic API Mimicry** and **Collateral Freedom**. It intentionally trades raw protocol efficiency for absolute statistical camouflage against well-funded network filters.
 
 * **Blending Into Ordinary Traffic:** Advanced firewalls use Shannon entropy heuristics to flag fully encrypted payloads (which look like pure white noise). To counter this, MirageProxy encodes the stream in Base64 (slightly lowering entropy) and wraps it in standard JSON, so the traffic profile resembles mundane enterprise API calls. To be clear, this is statistical camouflage, **not** encryption: a middlebox that reassembles and deep-parses individual HTTP requests *can* recognize the pattern. The goal is to look ordinary enough to pass generic mass filtering, not to defeat an adversary that has decided to analyze your traffic specifically.
-* **Hiding in the Noise (Collateral Freedom):** By using chunked HTTP POSTs and long-polling GETs, MirageProxy mimics the exact behavior of mundane, legacy enterprise REST APIs, telemetry uploads, or corporate data syncs. If a network filter aggressively blocks this traffic profile, they risk breaking legitimate traffic.
+* **Hiding in the Noise (Collateral Freedom):** By using chunked HTTP POSTs and long-polling GETs, MirageProxy mimics the exact behavior of mundane, legacy enterprise REST APIs, telemetry uploads, or corporate data syncs. If a network filter aggressively blocks this traffic profile, they risk breaking legitimate traffic. On top of that, the server ages every accepted connection out at a uniformly random lifetime (60–300 seconds) and winds it down like routine server maintenance, so the traffic never settles into the long-lived, fixed-shape pattern that flow analysis looks for.
 * **Defeating Active Probes:** Network scanners frequently send malformed TCP packets or garbage HTTP requests to suspected proxy ports to see how the server responds. MirageProxy drops these instantly and serves a flawless `nginx/1.31.7` 404 Not Found page, tricking network scanners into categorizing the server as an abandoned web host.
 * **Replay Resistance:** Observers sometimes capture packets and replay them minutes or hours later to map server behavior. MirageProxy signs every request with an HMAC-SHA256 signature over a rolling timestamp (`X-Auth-Time` / `X-Auth-Sig`), so replays outside the 90-second window are rejected and served the fake Nginx 404 page. Note the limit: there is no nonce cache, so a captured request replayed *within* that 90-second window would still be accepted. The window bounds the usefulness of a replay rather than eliminating it.
 * **Defeating MITM Attacks:** Intercepting parties sometimes attempt Man-In-The-Middle attacks by presenting fake SSL certificates. Because MirageProxy is designed to run behind a standard reverse proxy or CDN, the client strictly enforces standard CA verification. Any MITM attempt will immediately terminate the connection.
@@ -218,7 +219,9 @@ The `smoke/` directory contains an end-to-end smoke test that exercises the full
 `curl → sslocal → client → HTTPS → server → ssserver → test target` — and verifies data
 integrity with SHA-256, plus the active-probe camouflage.
 
-**Local mode** (no Docker; builds client + server from source with a fresh paired secret):
+**Local mode** (no Docker; builds client + server from source with a fresh paired secret;
+requires `go`, `openssl`, `curl`, `tar`, `wget`, and `sha256sum` on `PATH` — `ssserver` is
+downloaded automatically if it is missing):
 ```bash
 ./smoke/run-smoke.sh
 ```
@@ -231,10 +234,10 @@ client from the container, will ask for your sudo password):
 
 What it checks:
 1. Health check through the full tunnel.
-2. Download integrity (1 KiB / 4 MiB / chunked streaming) against a deterministic generator.
+2. Download integrity (1 KiB / 4 MiB / 2 MiB chunked streaming) against a deterministic generator.
 3. Upload integrity (1 MiB POST echoed back through the tunnel).
 4. Parallel downloads (2 × 1 MiB) across concurrent sessions.
-5. Unauthenticated probes receive the fake `nginx/1.31.7` 404 page.
+5. Unauthenticated probes receive the fake `nginx/1.31.7` 404 page (status code and `Server` banner).
 6. Real-internet reachability through the tunnel (informational only).
 
 Logs and artifacts are kept in `/tmp/mirage-smoke-*/` for debugging.
@@ -243,5 +246,5 @@ Logs and artifacts are kept in `/tmp/mirage-smoke-*/` for debugging.
 
 * **CDN SSL Settings:** If using a CDN, ensure your SSL/TLS encryption mode is set to **Full** (not Strict), so the CDN accepts the container's internal self-signed cert.
 * **Hanging on `SOCKS5 request granted`:** Ensure your `mirageproxy_client` is running, and that your VPS firewall allows inbound TCP traffic on the port you exposed.
-* **Logs:** If you are experiencing issues, edit the `.go` source files and change `const DebugMode = false` to `true`. Rebuild the container to see detailed chunk-level data transfer logs.
+* **Logs:** If you are experiencing issues, edit `client/types.go` and/or `server/types.go` and change `const DebugMode = false` to `true`. Rebuild the container to see detailed chunk-level data transfer logs.
 * **Server Logs:** View the server's background activity by running `sudo docker logs -f mirageproxy` on your VPS.
