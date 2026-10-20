@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
-	"crypto/tls"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -19,7 +18,7 @@ import (
 )
 
 // Set to true to see detailed chunk-level logs. Set to false for connection-only logs.
-const DebugMode = false
+const DebugMode = true
 
 // Injected at build time via -ldflags
 var (
@@ -713,9 +712,9 @@ func main() {
 	mux.HandleFunc("/", camouflage) // Catch-all for active probes
 
 	server := &http.Server{
-		Addr:         LocalListenAddr,
-		Handler:      mux,
-		TLSNextProto: make(map[string]func(*http.Server, *tls.Conn, http.Handler)),
+		Addr:    LocalListenAddr,
+		Handler: mux,
+		// Deleted the TLSNextProto line!
 	}
 
 	log.Printf("[MAIN] Server listening on https://%s", LocalListenAddr)
