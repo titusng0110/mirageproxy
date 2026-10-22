@@ -2,11 +2,72 @@ package main
 
 import (
 	"context"
-	"encoding/base64"
 	"log"
 	"net"
-	"strings"
+	"sync"
 	"time"
+
+	"mirageproxy/internal/shared"
+)
+
+const (
+	readTimeout         = 180 * time.Second
+	downstreamChunkSize = 8 * 1024 // server→client part size: small enough to piggyback on POST responses
+	piggybackBudget     = 8 * 1024 // max downstream data attached to one upload response
+	idleTimeout         = 15 * time.Minute
+	downstreamQueueCap  = 8192             // global downstream queue (parts); producers block when full
+	groupQueueCap       = 2000             // per-client downstream buffer drained by /poll and upload responses
+	windowSeqs          = 32               // per-session upload reorder window (sequences)
+	finalGrace          = 10 * time.Second // how long a finalized session waits for its window to drain
+	tombstoneTTL        = 2 * time.Minute  // how late parts for a closed session are NAKed instead of recreated
+)
+
+type messageBuffer struct {
+	totalParts int
+	parts      map[int]string
+	updatedAt  time.Time
+}
+
+// rxWindow is the upload reorder window for one session: the next sequence
+// expected at the head plus buffered future sequences. Data is written to
+// Shadowsocks only when the head sequence is fully assembled, cascading
+// through any complete sequences behind it.
+type rxWindow struct {
+	head      int
+	entries   map[int]*messageBuffer
+	updatedAt time.Time
+}
+
+type ClientGroup struct {
+	DownstreamChan chan shared.Part
+	LastActive     time.Time
+}
+
+type Session struct {
+	RequestID    string
+	ClientID     string
+	Conn         net.Conn
+	writeMutex   sync.Mutex
+	cancel       context.CancelFunc
+	mu           sync.Mutex
+	win          *rxWindow
+	closed       bool
+	finalSeen    bool
+	finalizer    bool // finalizer goroutine started
+	lastActivity time.Time
+}
+
+var (
+	stateMu      sync.RWMutex
+	sessions     = make(map[string]*Session)
+	clientGroups = make(map[string]*ClientGroup)
+
+	tombstonesMu sync.Mutex
+	tombstones   = make(map[string]time.Time)
+
+	// Global downstream queue: every session pushes its parts here, and a
+	// single router goroutine fans them out to the per-client buffers.
+	downstream = make(chan shared.Part, downstreamQueueCap)
 )
 
 func getClientGroup(clientID string) *ClientGroup {
@@ -15,7 +76,7 @@ func getClientGroup(clientID string) *ClientGroup {
 	cg, exists := clientGroups[clientID]
 	if !exists {
 		cg = &ClientGroup{
-			DownstreamChan: make(chan part, groupQueueCap),
+			DownstreamChan: make(chan shared.Part, groupQueueCap),
 			LastActive:     time.Now(),
 		}
 		clientGroups[clientID] = cg
@@ -69,7 +130,7 @@ func (s *Session) closeSession() {
 	// its own idle handling.
 	if s.ClientID != "" {
 		select {
-		case downstream <- part{ClientID: s.ClientID, RequestID: s.RequestID, Final: true}:
+		case downstream <- shared.Part{ClientID: s.ClientID, RequestID: s.RequestID, Final: true}:
 		default:
 		}
 	}
@@ -145,30 +206,22 @@ func (s *Session) startSession(ctx context.Context) {
 			s.mu.Unlock()
 			seq++
 
-			encodedStr := base64.StdEncoding.EncodeToString(buf[:n])
-			totalLen := len(encodedStr)
-			totalChunks := (totalLen + downstreamChunkSize - 1) / downstreamChunkSize
+			chunks := shared.Chunk(buf[:n], downstreamChunkSize)
 
 			if DebugMode {
-				log.Printf("[DOWNSTREAM] %s: Read %d bytes from Shadowsocks, queueing %d parts (Seq: %d)", s.RequestID, n, totalChunks, seq)
+				log.Printf("[DOWNSTREAM] %s: Read %d bytes from Shadowsocks, queueing %d parts (Seq: %d)", s.RequestID, n, len(chunks), seq)
 			}
 
 			// The send into the global queue blocks when it is full: that is
 			// the backpressure point between ssserver and the tunnel.
-			for i := 0; i < totalChunks; i++ {
-				start := i * downstreamChunkSize
-				end := start + downstreamChunkSize
-				if end > totalLen {
-					end = totalLen
-				}
-
-				p := part{
+			for i, chunk := range chunks {
+				p := shared.Part{
 					ClientID:   s.ClientID,
 					RequestID:  s.RequestID,
 					Seq:        seq,
 					Part:       i + 1,
-					TotalParts: totalChunks,
-					Data:       encodedStr[start:end],
+					TotalParts: len(chunks),
+					Data:       chunk,
 				}
 
 				select {
@@ -233,11 +286,7 @@ func (s *Session) flushLocked() {
 		}
 		flushedSeq := w.head
 
-		var combined strings.Builder
-		for i := 1; i <= mb.totalParts; i++ {
-			combined.WriteString(mb.parts[i])
-		}
-		data, err := base64.StdEncoding.DecodeString(combined.String())
+		data, err := shared.Assemble(mb.parts, mb.totalParts)
 
 		delete(w.entries, w.head)
 		w.head++
@@ -251,7 +300,7 @@ func (s *Session) flushLocked() {
 			log.Printf("[UPLOAD] Reassembled Seq %d for %s, writing %d bytes to Shadowsocks", flushedSeq, s.RequestID, len(data))
 		}
 		s.writeMutex.Lock()
-		writeErr := writeFull(s.Conn, data)
+		writeErr := shared.WriteFull(s.Conn, data)
 		s.writeMutex.Unlock()
 		if writeErr != nil {
 			log.Printf("[UPLOAD] Write error for %s seq %d: %v", s.RequestID, flushedSeq, writeErr)
@@ -261,7 +310,7 @@ func (s *Session) flushLocked() {
 
 // handleUploadPart processes one part of an upload batch and reports whether
 // it was accepted.
-func handleUploadPart(p part) bool {
+func handleUploadPart(p shared.Part) bool {
 	if p.Final {
 		stateMu.RLock()
 		sess, exists := sessions[p.RequestID]
@@ -324,4 +373,62 @@ func handleUploadPart(p part) bool {
 	}
 
 	return sess.admit(p.Seq, p.Part, p.TotalParts, p.Data)
+}
+
+func backgroundCleanup() {
+	for {
+		time.Sleep(1 * time.Minute)
+		now := time.Now()
+		var expiredSessions []string
+
+		stateMu.RLock()
+		for reqID, sess := range sessions {
+			sess.mu.Lock()
+			inactive := now.Sub(sess.lastActivity) > idleTimeout
+
+			w := sess.win
+			if w != nil && len(w.entries) > 0 && now.Sub(w.updatedAt) > 2*time.Minute {
+				// The head sequence never completed; slide past the gap so
+				// buffered future sequences can flow again.
+				minSeq := -1
+				for s := range w.entries {
+					if minSeq == -1 || s < minSeq {
+						minSeq = s
+					}
+				}
+				if minSeq > w.head {
+					if DebugMode {
+						log.Printf("[CLEANUP] Sliding upload window for %s from seq %d to %d", reqID, w.head, minSeq)
+					}
+					w.head = minSeq
+					sess.flushLocked()
+				}
+				w.updatedAt = now
+			}
+			sess.mu.Unlock()
+
+			if inactive {
+				expiredSessions = append(expiredSessions, reqID)
+			}
+		}
+		stateMu.RUnlock()
+
+		for _, reqID := range expiredSessions {
+			stateMu.RLock()
+			sess, ok := sessions[reqID]
+			stateMu.RUnlock()
+			if ok {
+				sess.closeSession()
+				log.Printf("[CLEANUP] Evicted dead session: %s", reqID)
+			}
+		}
+
+		tombstonesMu.Lock()
+		for id, t := range tombstones {
+			if now.Sub(t) > tombstoneTTL {
+				delete(tombstones, id)
+			}
+		}
+		tombstonesMu.Unlock()
+	}
 }

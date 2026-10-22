@@ -246,5 +246,5 @@ Logs and artifacts are kept in `/tmp/mirage-smoke-*/` for debugging.
 
 * **CDN SSL Settings:** If using a CDN, ensure your SSL/TLS encryption mode is set to **Full** (not Strict), so the CDN accepts the container's internal self-signed cert.
 * **Hanging on `SOCKS5 request granted`:** Ensure your `mirageproxy_client` is running, and that your VPS firewall allows inbound TCP traffic on the port you exposed.
-* **Logs:** If you are experiencing issues, edit `client/types.go` and/or `server/types.go` and change `const DebugMode = false` to `true`. Rebuild the container to see detailed chunk-level data transfer logs.
+* **Logs:** If you are experiencing issues, edit `client/main.go` and/or `server/main.go` and change `const DebugMode = false` to `true`. Rebuild the container to see detailed chunk-level data transfer logs.
 * **Server Logs:** View the server's background activity by running `sudo docker logs -f mirageproxy` on your VPS.

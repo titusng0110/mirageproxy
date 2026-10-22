@@ -8,10 +8,20 @@ import (
 	"log"
 	"net/http"
 	"time"
+
+	"mirageproxy/internal/shared"
+)
+
+const (
+	uploadQueueCap       = 8192                 // global upload queue capacity (parts); producers block when full
+	dispatcherWorkers    = 4                    // workers draining the global upload queue
+	dispatchPollInterval = 7 * time.Millisecond // queue recheck cadence when the queue is empty
+	maxSendAttempts      = 5                    // per-part retries before the connection is killed
+	postAttemptTimeout   = 60 * time.Second     // per-POST attempt deadline
 )
 
 func mustMarshal(v any) []byte {
-	// part contains only strings and ints; marshalling cannot fail.
+	// Part contains only strings and ints; marshalling cannot fail.
 	b, err := json.Marshal(v)
 	if err != nil {
 		panic(err)
@@ -78,7 +88,7 @@ func gatherBatch() []uploadItem {
 // bit per part plus any downstream parts that piggybacked on the response.
 // A transport error, non-200 status, or unparseable ack body returns an
 // error, which the caller treats as "nothing acked".
-func fireBatch(client *http.Client, batch []uploadItem) ([]bool, []part, error) {
+func fireBatch(client *http.Client, batch []uploadItem) ([]bool, []shared.Part, error) {
 	var body bytes.Buffer
 	body.WriteString(`{"parts":[`)
 	for i := range batch {
@@ -99,9 +109,7 @@ func fireBatch(client *http.Client, batch []uploadItem) ([]bool, []part, error) 
 		return nil, nil, err
 	}
 
-	now := time.Now().Unix()
-	req.Header.Set("X-Auth-Time", fmt.Sprintf("%d", now))
-	req.Header.Set("X-Auth-Sig", generateSignature(now, "upload-"+myClientID))
+	shared.SignRequest(req, ProxySecret, shared.UploadID(myClientID))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36")
 
@@ -119,7 +127,7 @@ func fireBatch(client *http.Client, batch []uploadItem) ([]bool, []part, error) 
 		return nil, nil, fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
 
-	var ack ackPayload
+	var ack shared.AckPayload
 	if err := json.NewDecoder(resp.Body).Decode(&ack); err != nil {
 		return nil, nil, fmt.Errorf("bad ack body: %v", err)
 	}

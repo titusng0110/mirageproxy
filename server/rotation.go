@@ -10,6 +10,21 @@ import (
 	"time"
 )
 
+const (
+	// Connection rotation: no TCP connection is allowed to live long
+	// enough for DPI flow heuristics to single it out as a tunnel. Each
+	// connection gets a uniformly random lifetime in this range and is
+	// then wound down — HTTP/2 with a graceful GOAWAY, HTTP/1.1 with a
+	// plain close — so rotation reads as routine server maintenance.
+	rotateMinAge       = 60 * time.Second  // shortest allowed connection lifetime
+	rotateMaxAge       = 300 * time.Second // longest allowed connection lifetime
+	rotateGrace        = 30 * time.Second  // drain window after GOAWAY before force-close
+	rotateSweepEvery   = 5 * time.Second   // rotator sweep cadence
+	minAgeBeforeGOAWAY = 5 * time.Second   // never inject GOAWAY before the handshake window settles
+	handshakeTimeout   = 10 * time.Second  // bound on the accept-path TLS handshake
+	goawayWriteTimeout = 2 * time.Second   // bound on the injected GOAWAY write; a stalled write must not freeze the rotator
+)
+
 // ============================================================================
 // Connection rotation
 //

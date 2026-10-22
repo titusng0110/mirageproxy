@@ -2,8 +2,13 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"log"
 	"net"
+	"sync"
+	"time"
+
+	"mirageproxy/internal/shared"
 )
 
 func main() {
@@ -46,3 +51,66 @@ func main() {
 		}
 	}
 }
+
+// ============================================================================
+// Configuration, types and global state
+// ============================================================================
+
+const DebugMode = false
+
+var (
+	ProxySecret     = "default"
+	RemoteServerURL = "https://127.0.0.1:30001"
+)
+
+const (
+	LocalListenAddr = ":30000"
+	chunkSize       = 16 * 1024 // max base64 payload per part, and the per-POST batch budget
+)
+
+var myClientID = fmt.Sprintf("client-%d", time.Now().UnixNano())
+
+type session struct {
+	conn         net.Conn
+	writeMutex   sync.Mutex
+	lastActivity time.Time
+	mu           sync.Mutex
+}
+
+type chunkBuffer struct {
+	total     int
+	parts     map[int]string
+	updatedAt time.Time
+}
+
+// rxWindow is the downstream reorder window for one session: the next
+// sequence expected at the head plus buffered future sequences.
+type rxWindow struct {
+	head    int
+	entries map[int]*chunkBuffer
+}
+
+type uploadItem struct {
+	p        shared.Part
+	reqID    string
+	encoded  []byte // pre-marshalled JSON for this part
+	attempts int
+}
+
+var (
+	sessionMu sync.RWMutex
+	sessions  = make(map[string]*session)
+
+	downstreamMu      sync.Mutex
+	downstreamWindows = make(map[string]*rxWindow)
+
+	// Global upload queue. Every local connection feeds it; a fixed pool of
+	// dispatcher workers drains it. Items are FIFO; requeued (retried) parts
+	// go to the front so gaps fill first.
+	uploadMu      sync.Mutex
+	uploadNotFull = sync.NewCond(&uploadMu)
+	uploadQueue   []uploadItem
+
+	flowsMu sync.Mutex
+	flows   = make(map[string]*connFlow)
+)
